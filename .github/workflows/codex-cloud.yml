@@ -1,0 +1,79 @@
+name: Codex CLI Bridge
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Public prompt for Codex"
+        required: true
+        type: string
+      mode:
+        description: "Inspect the repository or propose a patch"
+        default: inspect
+        type: choice
+        options:
+          - inspect
+          - patch
+
+permissions:
+  contents: read
+
+jobs:
+  codex:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Codex and Ollama
+        env:
+          OLLAMA_CONTEXT_LENGTH: "32768"
+        run: |
+          npm install --global @openai/codex@0.166.0
+          curl --fail --silent --show-error --location https://ollama.com/install.sh | sh
+          if ! ollama list >/dev/null 2>&1; then
+            nohup ollama serve > "${RUNNER_TEMP}/ollama.log" 2>&1 &
+          fi
+          for attempt in {1..30}; do
+            if ollama list >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          ollama pull qwen3:4b
+      - name: Run Codex
+        env:
+          TASK_PROMPT: ${{ inputs.prompt }}
+          TASK_MODE: ${{ inputs.mode }}
+        run: |
+          base=$(git rev-parse HEAD)
+          sandbox=read-only
+          if [[ "$TASK_MODE" == patch ]]; then sandbox=workspace-write; fi
+          printf '%s' "$TASK_PROMPT" |
+            codex exec --oss --local-provider ollama --model qwen3:4b \
+              --sandbox "$sandbox" --ignore-user-config \
+              -c 'approval_policy="never"' -c 'web_search="disabled"' \
+              -c 'model_context_window=32768' \
+              --output-last-message "${RUNNER_TEMP}/codex-reply.txt" - \
+              > "${RUNNER_TEMP}/codex-output.log" 2>&1
+          if [[ "$TASK_MODE" == patch ]]; then
+            git add -N -- .
+            git diff --no-ext-diff "$base" -- . > "${RUNNER_TEMP}/codex.patch"
+          fi
+      - name: Bridge result
+        run: |
+          python3 - <<'PY'
+          import base64, json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          def read_result(name, limit):
+              path = root / name
+              if not path.is_file():
+                  return "", False
+              with path.open("rb") as stream:
+                  chunk = stream.read(limit + 1)
+              return chunk[:limit].decode("utf-8", errors="replace"), len(chunk) > limit
+          message, message_truncated = read_result("codex-reply.txt", 12000)
+          patch, patch_truncated = read_result("codex.patch", 24000)
+          result = json.dumps(dict(message=message, patch=patch,
+                                   truncated=message_truncated or patch_truncated))
+          print("CODEX_BRIDGE_RESULT:" + base64.b64encode(result.encode()).decode())
+          PY
